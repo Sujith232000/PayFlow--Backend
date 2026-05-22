@@ -1,0 +1,60 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String
+  password  String
+  balance   Decimal  @default(0)
+  createdAt DateTime @default(now())
+
+  // Relations
+  sentTransactions     Transaction[] @relation("SentMoney")
+  receivedTransactions Transaction[] @relation("ReceivedMoney")
+  dailyLimit            UserDailyLimit?
+}
+
+model Transaction {
+  id        String   @id @default(uuid())
+  amount    Decimal
+  createdAt DateTime @default(now())
+
+  senderId String
+  sender   User   @relation("SentMoney", fields: [senderId], references: [id])
+
+  receiverId String
+  receiver   User   @relation("ReceivedMoney", fields: [receiverId], references: [id])
+
+  @@index([senderId, createdAt])
+  @@index([receiverId, createdAt])
+
+}
+
+model UserDailyLimit{
+  id  String @id@default(uuid())
+  userId  String @unique
+  user    User @relation(fields:[userId], references:[id])
+  dailyTotal Decimal @default(0)
+  lastResetDate DateTime @default (now())
+}
+
+model SecurityLog{
+  id   String @id@default(uuid())
+  event String 
+  status String
+  userId String?
+  details String?
+  ipAddress String?
+  createdAt DateTime @default(now())
+}
