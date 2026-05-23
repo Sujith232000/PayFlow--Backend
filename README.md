@@ -28,21 +28,20 @@ A high-performance, secure, and ACID-compliant banking ledger backend designed t
 
 ##  Production API Reference
 
-###  Authentication Gateway
+### 🔐 Authentication Gateway
 | Method | Endpoint | Description | Payload (JSON) |
 | :--- | :--- | :--- | :--- |
 | `POST` | `/api/v1/signup` | Registers a permanent cloud user account | `{"name": "...", "email": "...", "password": "..."}` |
-| `POST` | `/api/v1/login` | Authenticates user and returns JWT access passport token | `{"email": "...", "password": "..."}` |
+| `POST` | `/api/v1/login` | Authenticating user credentials and returns custom JWT access token | `{"email": "...", "password": "..."}` |
 
-###  Financial Transactions (Protected Routes)
+###  User & Financial Ledger Services (Protected Routes)
 *Requires `Authorization: Bearer <JWT_TOKEN>` header*
 
-| Method | Endpoint | Description | Payload (JSON) |
+| Method | Endpoint | Description | Payload / Query Options |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/api/v1/transfer` | Processes an atomic monetary transfer between accounts | `{"receiverId": "UUID_STRING", "amount": 50}` |
-| `GET` | `/api/v1/ledger` | Fetches historical ledger records for the authenticated profile | *None* |
-
----
+| `POST` | `/api/v1/transfer` | Processes an atomic monetary transfer between accounts (*Rate-limited via middleware*) | **Body:** `{"receiverId": "UUID", "amount": 50}` |
+| `GET` | `/api/v1/profile` | Fetches core account details and balance for the authenticated user | *None* |
+| `GET` | `/api/v1/history` | Retrieves complete transaction history logs processed through the validation layer | **Query:** Validated against `historyQuerySchema` |
 
 ## Local Development Setup
 
