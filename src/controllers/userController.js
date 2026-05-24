@@ -13,9 +13,7 @@ const transferMoney = asyncWrapper(async (req, res) => {
     const { receiverId, amount } = req.body; 
     const senderId = req.userId; // Provided by protect middleware
 
-    //console.log("--- DEBUG LIVE CONTROLLER GATE ---", { receiverId, amount, type: typeof amount });
-
-    // 🚨 ABSOLUTE FAIL-SAFE GUARD: Reject negative numbers instantly at the controller gate
+    // ABSOLUTE FAIL-SAFE GUARD: Reject negative numbers instantly at the controller gate
     if (amount <= 0) {
         throw new AppError("cannot be a negative number", 400);
     }
@@ -25,85 +23,80 @@ const transferMoney = asyncWrapper(async (req, res) => {
         throw new AppError("Cannot send money to yourself", 400);
     }
 
-
     // --- DAILY LIMIT LOGIC ---
-    // Fetch the user's spending record for today
     const limitRecord = await prisma.userDailyLimit.findUnique({ where: { userId: senderId } });
     let effectiveTotal = 0;
 
-    // Check if the record exists AND if it was updated today
     if (limitRecord && limitRecord.lastResetDate.toDateString() === new Date().toDateString()) {
         effectiveTotal = Number(limitRecord.dailyTotal);
     }
     
-    // Total spent today + this current amount must be <= $500
     if (effectiveTotal + amount > 500) {
         throw new AppError("Daily limit of $500 exceeded", 400);
     }
 
     // --- OVERDRAFT PRE-CALCULATION (SAFETY CHECK) ---
-    // Fetch sender to check balance before starting the expensive database transaction
     const sender = await prisma.user.findUnique({ where: { id: senderId } });
     const currentBalance = Number(sender.balance);
 
-    // Calculate if this transfer will trigger an overdraft fee
     const balanceAfterTransfer = currentBalance - amount;
     let totalCost = amount;
     
     if (balanceAfterTransfer < 0) {
-        // If balance drops below 0, the bank adds a $5 overhead fee
         totalCost = amount + BankConstants.FINANCIAL.OVERDRAFT_FEE;
     }
 
-    // HARD LIMIT: No user can go below -$100 (including the fee)
     if (currentBalance - totalCost < BankConstants.FINANCIAL.MAX_DEBT) {
         throw new AppError(`Transaction Denied: Exceeds ${BankConstants.FINANCIAL.MAX_DEBT} credit limit (including $${BankConstants.FINANCIAL.OVERDRAFT_FEE} fee)`, 400);
     }
 
     // --- ATOMIC DATABASE TRANSACTION ---
-    // We use $transaction to ensure all steps succeed or all fail together.  
     await prisma.$transaction(async (tx) => {
         await tx.$executeRaw`SET LOCAL lock_timeout = '5000ms'`;
-        // 1. ROW-LEVEL LOCKING: 'FOR UPDATE' prevents other transactions from 
-        // touching this user's balance until we are finished.
+        
+        // 1. ROW-LEVEL LOCKING
         const senderResult = await tx.$queryRaw`SELECT * FROM "User" WHERE id = ${senderId} FOR UPDATE`;
         const lockedSender = senderResult[0];
         if (!lockedSender) throw new AppError("Sender not found", 404);
+        
         const actualBalance = Number(lockedSender.balance);
         if (actualBalance - amount < BankConstants.FINANCIAL.MAX_DEBT) {
             throw new AppError("Insufficient funds (Concurrency Check)", 400);
-       }
+        }
+        
         const receiver = await tx.user.findUnique({ where: { id: receiverId } });
-
-        // Double-check existence inside the transaction for ultimate safety
-        if (!lockedSender) throw new AppError("Sender not found", 404);
         if (!receiver) throw new AppError("Receiver not found", 404);
 
-        // 2. MOVE THE MONEY: Update both balances
-        await tx.user.update({
+        // 2. MOVE THE MONEY: Capture the returned updated models to read the exact balances
+        const updatedSender = await tx.user.update({
             where: { id: senderId },
             data: { balance: { decrement: amount } }
         });
 
-        await tx.user.update({
+        const updatedReceiver = await tx.user.update({
             where: { id: receiverId },
             data: { balance: { increment: amount } }
         });
 
-        // 3. OVERDRAFT FEE EXECUTION:
-        // We only charge the fee if the user crossed the 0 line in THIS transaction.
-        const wasPositive = Number(lockedSender.balance) >= 0; // past balance befor the transfer 
-        const senderStatus = await tx.user.findUnique({ where: { id: senderId } }); // current balance after transfer
-        const isNowNegative = Number(senderStatus.balance) < 0;
+        // Initialize our tracking states for the audit logs
+        let finalSenderBalance = Number(updatedSender.balance);
+        let feeChargedInThisSession = false;
+
+        // 3. OVERDRAFT FEE EXECUTION
+        const wasPositive = Number(lockedSender.balance) >= 0;
+        const isNowNegative = Number(updatedSender.balance) < 0;
 
         if (wasPositive && isNowNegative) {
-            // Subtract the fee from the user
-            await tx.user.update({
+            const updatedSenderWithFee = await tx.user.update({
                 where: { id: senderId },
                 data: { balance: { decrement: BankConstants.FINANCIAL.OVERDRAFT_FEE } }
             });
 
-            // LOG THE FEE: Create a ledger record so the user sees why $5 left
+            // Update our tracking states with the final post-fee calculations
+            finalSenderBalance = Number(updatedSenderWithFee.balance);
+            feeChargedInThisSession = true;
+
+            // LOG THE FEE TO LEDGER
             await tx.transaction.create({
                 data: { 
                     amount: BankConstants.FINANCIAL.OVERDRAFT_FEE, 
@@ -113,12 +106,42 @@ const transferMoney = asyncWrapper(async (req, res) => {
             });
         }
 
-        // 4. LOG THE MAIN TRANSFER: Record the $ amount sent to the receiver
+        // 4. LOG THE MAIN TRANSFER (Cleaned up duplicate)
         await tx.transaction.create({
             data: { amount, senderId, receiverId }
         });
 
-        // 5. UPDATE DAILY SPENDING: Upsert (Update or Insert) the limit record
+        // 🛠️ IMMUTABLE AUDIT TRAIL RECORDING
+        await tx.auditLog.create({
+            data: {
+                userId: senderId,
+                type: "TRANSFER_SENT",
+                amount: Number(amount),
+                balanceAfter: finalSenderBalance
+            }
+        });
+
+        await tx.auditLog.create({
+            data: {
+                userId: receiverId,
+                type: "TRANSFER_RECEIVED",
+                amount: Number(amount),
+                balanceAfter: Number(updatedReceiver.balance)
+            }
+        });
+
+        if (feeChargedInThisSession) {
+            await tx.auditLog.create({
+                data: {
+                    userId: senderId,
+                    type: "OVERDRAFT_FEE",
+                    amount: Number(BankConstants.FINANCIAL.OVERDRAFT_FEE),
+                    balanceAfter: finalSenderBalance
+                }
+            });
+        }
+
+        // 5. UPDATE DAILY SPENDING
         await tx.userDailyLimit.upsert({
             where: { userId: senderId },
             update: {
@@ -132,7 +155,7 @@ const transferMoney = asyncWrapper(async (req, res) => {
             }
         });
 
-        // 6. SECURITY AUDIT: Log success for bank compliance tracking
+        // 6. SECURITY AUDIT
         await tx.securityLog.create({
             data: {
                 event: 'Transfer Completed',

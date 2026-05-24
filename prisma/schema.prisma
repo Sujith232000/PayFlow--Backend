@@ -18,6 +18,8 @@ model User {
   password  String
   balance   Decimal  @default(0)
   createdAt DateTime @default(now())
+  auditLogs AuditLog[]
+
 
   // Relations
   sentTransactions     Transaction[] @relation("SentMoney")
@@ -56,5 +58,22 @@ model SecurityLog{
   userId String?
   details String?
   ipAddress String?
+  createdAt DateTime @default(now())
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String
+  type       String   // "TRANSFER_SENT", "TRANSFER_RECEIVED", "OVERDRAFT_FEE"
+  amount     Float
+  balanceAfter Float
+  timestamp  DateTime @default(now())
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model IdempotencyKey {
+  key       String   @id // The unique client-generated string (x-idempotency-key)
+  response  Json     // Canned response payload to return on retries
   createdAt DateTime @default(now())
 }
